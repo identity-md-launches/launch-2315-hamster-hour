@@ -23,7 +23,7 @@ For each successful buy, let the AMM input be `P`, its HAMSTER output be `Q`, an
 | Fee recipient | `+F` | `0` |
 | Hook | `0` | `0` |
 
-`take` initially debits the hook's transient balance by `F`. The positive returned hook delta credits it by exactly `F` and debits the trader. No claim is minted. A completed unlock must have no nonzero deltas.
+`take` (or, when the manager holds less than `F` IMD mid-swap, `mint` of an ERC-6909 IMD claim to the hook) debits the hook's transient balance by `F`. The positive returned hook delta credits it by exactly `F` and debits the trader. A claim sweep is `burn(c)` (credit `c`) plus `take(c)` to the recipient (debit `c`), which nets to zero. A completed unlock must have no nonzero deltas. Claims can only become IMD paid to `FEE_RECIPIENT`, either through the next covered buy or through the permissionless `redeem()`. `unlockCallback` accepts calls only from the PoolManager, and the manager only calls back the contract that unlocked it.
 
 The critical `beforeSwapReturnDelta` flag is used only to reserve the IMD fee. It is bounded by the current rate, never consumes the entire nonzero input budget, and cannot redirect payment. The partial-fill preview always reverts its nested execution. Its only accepted success signal is the precisely sized `QuotedInput(uint256)` error. Other failures are bubbled rather than interpreted as a quote.
 
@@ -33,11 +33,11 @@ The positive fee rate is permanent. Integer dust may have zero **fee amount**, b
 
 ## External calls and reentrancy
 
-The hook calls only itself for the reverting preview and its immutable PoolManager for swaps/takes. It never calls a user-provided address, router, recipient function, oracle, or conversion market. The actual recipient transfer uses the manager's ERC-20 transfer implementation.
+The hook calls only itself for the reverting preview, its immutable PoolManager for swaps/takes/mints/burns/unlock, and IMD's `balanceOf` (view) for the manager's reserve. It never calls a user-provided address, router, recipient function, oracle, or conversion market. The actual recipient transfer uses the manager's ERC-20 transfer implementation.
 
 There is no mutable hook balance ledger or phase flag to corrupt by reentry. The preview calls the manager as the hook; core deliberately skips that hook's callbacks, avoiding recursive fee charging. Its revert rolls back transient as well as persistent manager state. Both currencies are fixed: ordinary HAMSTER and the specified mainnet IMD. Support for arbitrary fee-on-transfer, rebasing, pausable or callback-bearing currencies is not claimed.
 
-Immediate payout still requires actual IMD to be in the manager before `take`. The prepayment integration requirement and a failing unfunded-postpayment test are explicit in the README. No implementation can transfer absent funds, and no pending claim or fee waiver is substituted.
+Immediate payout is used only when the manager's IMD balance covers it. Otherwise the fee is minted as a claim, so a buy through a post-settling router never reverts because reserves are short. If the IMD balance read fails or returns malformed data, it counts as zero, which falls back to a claim. The fee is never waived.
 
 ## Test coverage
 
@@ -73,6 +73,6 @@ The gas figure includes the integration driver and settlement, depends on state 
 
 ## Release responsibilities
 
-The launch factory must deploy and initialize atomically with the prepared flags, correct token/manager, policy pool fee/spacing and opening price. The frontend/router must use suitable slippage limits and prepayment when existing manager IMD reserves are insufficient. A positive-rate fee is not bot identification, an MEV defense guarantee, or a restriction on creating other HAMSTER pools.
+The launch factory must deploy and initialize atomically with the prepared flags, correct token/manager, policy pool fee/spacing and opening price. The frontend/router must use suitable slippage limits; post-settling routers are supported through the claim fallback. A positive-rate fee is not bot identification, an MEV defense guarantee, or a restriction on creating other HAMSTER pools.
 
 No Slither/Mythril run, formal verification, independent audit, on-chain deployment, explorer publication or GitHub upload is claimed by this record. Those are distinct from the local and fork tests.

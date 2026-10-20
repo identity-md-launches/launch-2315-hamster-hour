@@ -3,10 +3,11 @@ pragma solidity 0.8.26;
 
 import {IHooks} from "v4-core/src/interfaces/IHooks.sol";
 import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
+import {IUnlockCallback} from "v4-core/src/interfaces/callback/IUnlockCallback.sol";
 import {Hooks} from "v4-core/src/libraries/Hooks.sol";
 import {FullMath} from "v4-core/src/libraries/FullMath.sol";
 import {SafeCast} from "v4-core/src/libraries/SafeCast.sol";
-import {Currency} from "v4-core/src/types/Currency.sol";
+import {Currency, CurrencyLibrary} from "v4-core/src/types/Currency.sol";
 import {PoolKey} from "v4-core/src/types/PoolKey.sol";
 import {PoolId} from "v4-core/src/types/PoolId.sol";
 import {SwapParams} from "v4-core/src/types/PoolOperation.sol";
@@ -15,8 +16,10 @@ import {BeforeSwapDelta, BeforeSwapDeltaLibrary, toBeforeSwapDelta} from "v4-cor
 import {DeploymentConfig} from "./DeploymentConfig.sol";
 
 /// @notice Immutable IMD-input fee for one HAMSTER/IMD pool.
-/// @dev Implements only the enabled IHooks callbacks. No fallback, owner, balances, claims, or setters.
-contract AntiSniperHook {
+/// @dev Implements only the enabled IHooks callbacks. No fallback, owner, balances, or setters.
+///      ERC-6909 IMD claims exist only when the manager cannot cover a fee mid-swap; they are
+///      redeemable solely to FEE_RECIPIENT, by anyone, and are swept by the next covered buy.
+contract AntiSniperHook is IUnlockCallback {
     using SafeCast for uint256;
 
     error OnlyPoolManager();
@@ -38,8 +41,12 @@ contract AntiSniperHook {
     address public immutable FEE_RECIPIENT;
     uint256 public immutable poolInitialisedAt;
 
-    /// @notice IMD was transferred directly from the manager to FEE_RECIPIENT.
+    /// @notice A buy fee was charged: paid to FEE_RECIPIENT now, or held as an IMD claim for it.
     event BuyFeePaid(address indexed sender, uint256 feeBps, uint256 feeAmount);
+    /// @notice The manager held too little IMD mid-swap, so the fee was minted as a claim for FEE_RECIPIENT.
+    event FeeClaimMinted(uint256 amount);
+    /// @notice Held claims were burned and paid out to FEE_RECIPIENT.
+    event FeeClaimRedeemed(uint256 amount);
 
     /// @param manager_ The launch chain's PoolManager, supplied by the deployer.
     /// @param hamster_ The token deployed immediately before this hook.
@@ -202,10 +209,55 @@ contract AntiSniperHook {
         if (PoolId.unwrap(key.toId()) != PoolId.unwrap(poolId)) revert WrongPool();
     }
 
+    /// @notice Pays any held IMD claims to FEE_RECIPIENT, up to the IMD the manager holds. Anyone may call.
+    function redeem() external returns (uint256 amount) {
+        amount = abi.decode(poolManager.unlock(""), (uint256));
+    }
+
+    function unlockCallback(bytes calldata) external onlyPoolManager returns (bytes memory) {
+        uint256 claims = poolManager.balanceOf(address(this), _imdId());
+        uint256 available = _managerImd();
+        uint256 amount = claims < available ? claims : available;
+        if (amount != 0) _redeem(amount);
+        return abi.encode(amount);
+    }
+
     function _payFee(address sender, uint256 rate, uint256 fee) private {
         if (fee == 0) return; // Integer dust does not trigger a token transfer.
         emit BuyFeePaid(sender, rate, fee);
         // Balances never pass through this contract. The returned hook delta cancels this debt.
+        // A postpaying router has not delivered its input yet, so take only IMD the manager holds;
+        // otherwise mint a claim, which needs no balance, so the buy never reverts on reserves.
+        uint256 available = _managerImd();
+        if (available < fee) {
+            poolManager.mint(address(this), _imdId(), fee);
+            emit FeeClaimMinted(fee);
+            return;
+        }
         poolManager.take(Currency.wrap(DeploymentConfig.IMD), FEE_RECIPIENT, fee);
+        uint256 claims = poolManager.balanceOf(address(this), _imdId());
+        if (claims != 0 && available - fee >= claims) _redeem(claims);
     }
+
+    /// @dev Burn credits the hook what take debits: net zero delta for the hook.
+    function _redeem(uint256 amount) private {
+        poolManager.burn(address(this), _imdId(), amount);
+        poolManager.take(Currency.wrap(DeploymentConfig.IMD), FEE_RECIPIENT, amount);
+        emit FeeClaimRedeemed(amount);
+    }
+
+    function _imdId() private pure returns (uint256) {
+        return CurrencyLibrary.toId(Currency.wrap(DeploymentConfig.IMD));
+    }
+
+    /// @dev A failing or malformed balance read counts as zero, so it falls back to a claim.
+    function _managerImd() private view returns (uint256 available) {
+        (bool ok, bytes memory data) =
+            DeploymentConfig.IMD.staticcall(abi.encodeWithSelector(IERC20Balance.balanceOf.selector, poolManager));
+        if (ok && data.length >= 32) available = abi.decode(data, (uint256));
+    }
+}
+
+interface IERC20Balance {
+    function balanceOf(address) external view returns (uint256);
 }

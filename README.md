@@ -69,7 +69,7 @@ All are immutable. `poolInitialisedAt` is set to the deployment block timestamp 
 
 **The factory must deploy the hook and initialize its pool atomically.** `beforeInitialize` accepts only the bound token/IMD pool with the fixed fee, spacing, and hook, and only at the constructor timestamp. A delayed initialization is rejected rather than silently starting trading after the anti-sniper period. The callback cannot reset the timestamp. Atomic deployment also prevents another transaction from choosing the initial price.
 
-No persistent storage is written after construction. There is no setter, pause, upgrade, withdrawal, claim redemption, rescue, or sweep. The recipient has no privileged action. Fee delivery transfers IMD directly from the PoolManager to the recipient, without routing funds through the hook or converting them to ETH.
+The hook contract writes no storage of its own after construction. There is no setter, pause, upgrade, withdrawal, rescue, or sweep. The recipient has no privileged action. Normally the fee is sent as IMD straight from the PoolManager to the recipient during the swap. It never passes through the hook and is not converted to ETH. If the manager does not hold enough IMD at that moment, the fee is minted as an ERC-6909 claim instead (see "Router settlement" below). The only extra entry point is the permissionless `redeem()`, and it can only pay `FEE_RECIPIENT`.
 
 ## Swap accounting and rounding
 
@@ -92,20 +92,16 @@ Both paths satisfy `F = floor((P+F)*r/10000)` and settle the hook's fee debt to 
 
 The **rate** never reaches zero. A fee **amount** smaller than one IMD minor unit rounds down to zero, as integer percentage arithmetic requires. Charging a minimum of one minor unit would overcharge tiny trades and could consume all their input, so no minimum is imposed.
 
-## Router settlement requirement
+## Router settlement and the claim fallback
 
-Immediate payout and ordinary v4 post-swap settlement have a physical constraint: `take(IMD, recipient, fee)` transfers real IMD while the swap is running, before a postpaying router has delivered its input. It succeeds when the manager already holds enough IMD. With insufficient reserves, an otherwise valid buy using that router can revert.
+Uniswap's V4Router / Universal Router call `swap` first and settle their input afterwards (SETTLE_ALL). So while the swap is running, the trader's IMD has not reached the manager yet. `_payFee` handles both cases, and a buy never reverts for lack of IMD reserves:
 
-**For buys that must work independently of existing manager reserves, the router must settle its input budget before calling `swap`.** Within the same unlock:
+- **Manager holds at least the fee in IMD:** `take(IMD, FEE_RECIPIENT, fee)` pays the recipient during the swap. If the hook still holds claims from earlier buys and the remaining reserve covers them, they are burned and paid out to the recipient in the same call.
+- **Manager holds less IMD than the fee** (for example a fresh launch pool seeded with HAMSTER only, used through a post-settling router): `mint(hook, IMD id, fee)` records the fee as an ERC-6909 claim. A claim needs no balance. The trader's later settlement backs it, so the buy goes through with exactly the same fee. The claim stays with the hook only until one of two things happens: the next buy that the manager can cover sweeps it automatically, or anyone calls `hook.redeem()`. `redeem()` unlocks the manager, burns the claim (capped at the manager's IMD balance) and takes the IMD to `FEE_RECIPIENT`. It cannot send to anyone else. It has no owner, no parameters and no way to change the amount.
 
-1. Pull only the calling user's approved input budget into the router.
-2. Call `manager.sync(IMD)`, transfer that budget to the manager, then call `manager.settle()`.
-3. Call `manager.swap(...)`.
-4. Close both currency deltas, return output and unused input, and enforce minimum output / maximum input.
+A router that settles before swapping (pull budget, `sync`, transfer, `settle`, then `swap`) always goes down the immediate path. `test/helpers/PoolDriver.sol` covers both orders. `test/Settlement.t.sol` runs both on a fresh manager seeded only with HAMSTER and checks the claim path, its automatic sweep, `redeem()` and the guard on `unlockCallback`.
 
-`test/helpers/PoolDriver.sol` demonstrates and tests this sequence, including a fresh manager seeded solely with HAMSTER and no IMD or ETH reserves. It is a test integration driver, not a third launch contract. A postpaying router is also tested against funded pools. A negative test records the unfunded postpayment failure; the implementation does not hide it by dropping fees or retaining claims.
-
-Consequently, an unconditional promise that **every** buy through **any** router can never revert is not possible together with mandatory immediate payment and no retained funds. This implementation has no discretionary trading gate; successful buys require normal valid pool inputs, sufficient user funds, slippage limits, v4 delta bounds, and the settlement condition above. Sells never execute the fee-transfer or preview path.
+The fee is paid in IMD, an ERC-20. A recipient contract cannot reject it the way it could reject ETH, so neither path depends on what the recipient does.
 
 ## Deployment and operations
 
@@ -114,10 +110,12 @@ Consequently, an unconditional promise that **every** buy through **any** router
 - Use the exact creation bytecode, compiler settings, constructor encoding and factory for the salt. Check all 14 low address bits against `0x20cc`; checking just the enabled bits is insufficient.
 - Deploy the no-argument token, then the hook, then initialize and seed the pool in one factory transaction. Use the launch's price calculation and allocation policy. The 1:1 price in most unit tests is only a fixture. The separate launch-price fork test derives the correct currency-dependent square-root price from 2,500 IMD capitalization and the one-billion-token supply.
 - Supply allocation remains the launch factory's responsibility: it initially receives the full supply and applies the launch's 10% distributor / 70% pool / 20% payer-or-treasury allocation. These two contracts do not allocate extra tokens or introduce another recipient.
-- Integrators must account for the hook fee and the separate LP fee, use slippage protection, and support prepayment for low-reserve buys. Exact-output integrations must also enforce their desired fill amount if a price limit allows partial execution.
+- Integrators must account for the hook fee and the separate LP fee, and use slippage protection. Post-settling routers work; a low-reserve buy through one leaves the fee as a claim until it is swept or `redeem()` is called. Exact-output integrations must also enforce their desired fill amount if a price limit allows partial execution.
 - Verify source and deployed bytecode, publish this repository on GitHub, and record the deployed addresses, pool ID, deployment transaction and immutable timestamp in the launch record. No addresses or transactions are represented here as already deployed. The launch manifest belongs to the separate manifest step; none is supplied here.
 - There are **no owner settings or recipient calls after launch**. The fee schedule runs automatically forever.
 
 The hook does not retain swap proceeds. Like any ERC-20 destination, it cannot prevent someone sending it unrelated tokens; unsolicited tokens cannot be recovered because there is deliberately no sweep. The fee is specific to this pool; standard HAMSTER can be traded elsewhere. The fee discourages early buys but is not a guarantee against bots or MEV.
+
+Known design limit: the fee applies only to swaps, as the brief defines it. The hook has no liquidity callbacks and never blocks anything. During the decay window, anyone can post a single-sided IMD range next to the price and let untaxed sells fill it. That buys HAMSTER from sellers at the pool price plus the LP fee, with no hook fee. Gating `beforeAddLiquidity` during the window would close this, but it is a scope decision for the requester. It would also have to keep letting the factory seed and collect.
 
 See [SECURITY.md](SECURITY.md) for the review scope and [DEPENDENCIES.md](DEPENDENCIES.md) for dependency pins and licenses.

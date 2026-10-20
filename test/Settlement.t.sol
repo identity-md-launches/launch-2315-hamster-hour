@@ -8,11 +8,16 @@ import {BalanceDelta} from "v4-core/src/types/BalanceDelta.sol";
 import {TickMath} from "v4-core/src/libraries/TickMath.sol";
 import {HamsterHourToken} from "../src/HamsterHourToken.sol";
 import {DeploymentConfig} from "../src/DeploymentConfig.sol";
+import {AntiSniperHook} from "../src/AntiSniperHook.sol";
+import {TransientStateLibrary} from "v4-core/src/libraries/TransientStateLibrary.sol";
+import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
 import {HookFixture} from "./helpers/HookFixture.sol";
 
 /// @notice Exercises the flash-accounting balance constraint of immediate ERC-20 fee delivery.
 contract SettlementTest is HookFixture {
+    using TransientStateLibrary for IPoolManager;
+
     function setUp() public {
         manager = new PoolManager(address(this));
         hamster = new HamsterHourToken();
@@ -54,16 +59,61 @@ contract SettlementTest is HookFixture {
         assertEq(imd.balanceOf(address(hook)), 0);
     }
 
-    function test_unfundedPostpayCannotPayFeeAndRevertsAtomically() public {
-        // Documents the integration constraint, rather than silently replacing immediate fees with claims.
+    function test_unfundedPostpayBuySucceedsAndHoldsFeeAsClaimForRecipient() public {
         uint256 payer = imd.balanceOf(address(this));
-        vm.expectRevert();
-        _swap(true, -int256(10 ether), 10 ether, false);
-        assertEq(imd.balanceOf(address(manager)), 0);
+        BalanceDelta d = _swap(true, -int256(10 ether), 10 ether, false);
+        assertEq(_input(d, true), 10 ether);
+        assertGt(_output(d, true), 0);
+        assertEq(imd.balanceOf(address(this)), payer - 10 ether);
+        // The manager could not pay mid-swap, so the 30% fee is an IMD claim held for FEE_RECIPIENT.
         assertEq(imd.balanceOf(DeploymentConfig.FEE_RECIPIENT), 0);
-        assertEq(imd.balanceOf(address(this)), payer);
+        assertEq(manager.balanceOf(address(hook), _imdId()), 3 ether);
+        assertEq(imd.balanceOf(address(manager)), 10 ether);
         assertEq(imd.balanceOf(address(hook)), 0);
-        assertEq(imd.balanceOf(address(driver)), 0);
+        assertEq(manager.getNonzeroDeltaCount(), 0);
+
+        // Anyone may redeem; the IMD can only go to FEE_RECIPIENT.
+        vm.prank(address(0xBEEF));
+        assertEq(hook.redeem(), 3 ether);
+        assertEq(imd.balanceOf(DeploymentConfig.FEE_RECIPIENT), 3 ether);
+        assertEq(manager.balanceOf(address(hook), _imdId()), 0);
+        assertEq(imd.balanceOf(address(manager)), 7 ether);
+        assertEq(imd.balanceOf(address(0xBEEF)), 0);
+    }
+
+    function test_unfundedPostpayExactOutputBuySucceedsWithClaim() public {
+        BalanceDelta d = _swap(true, int256(1 ether), 100 ether, false);
+        uint256 gross = _input(d, true);
+        assertEq(_output(d, true), 1 ether);
+        assertEq(manager.balanceOf(address(hook), _imdId()), gross * 3000 / 10_000);
+        assertEq(hook.redeem(), gross * 3000 / 10_000);
+        assertEq(imd.balanceOf(DeploymentConfig.FEE_RECIPIENT), gross * 3000 / 10_000);
+        assertEq(imd.balanceOf(address(manager)) + imd.balanceOf(DeploymentConfig.FEE_RECIPIENT), gross);
+    }
+
+    function test_nextCoveredBuySweepsHeldClaimToRecipient() public {
+        _swap(true, -int256(10 ether), 10 ether, false);
+        assertEq(manager.balanceOf(address(hook), _imdId()), 3 ether);
+        // The manager now holds 10 IMD, enough for the next fee (0.3) plus the held 3 IMD claim.
+        _swap(true, -int256(1 ether), 1 ether, false);
+        assertEq(manager.balanceOf(address(hook), _imdId()), 0);
+        assertEq(imd.balanceOf(DeploymentConfig.FEE_RECIPIENT), 3.3 ether);
+        assertEq(imd.balanceOf(address(manager)), 7.7 ether);
+        assertEq(hook.redeem(), 0);
+    }
+
+    function test_redeemWithoutClaimsIsNoOp() public {
+        assertEq(hook.redeem(), 0);
+        assertEq(imd.balanceOf(DeploymentConfig.FEE_RECIPIENT), 0);
+    }
+
+    function test_unlockCallbackOnlyFromPoolManager() public {
+        vm.expectRevert(AntiSniperHook.OnlyPoolManager.selector);
+        hook.unlockCallback("");
+    }
+
+    function _imdId() private pure returns (uint256) {
+        return uint256(uint160(DeploymentConfig.IMD));
     }
 
     function test_sellAtLaunchNeverAttemptsToPayRecipient() public {
